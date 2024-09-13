@@ -9,6 +9,7 @@ from layers.Embed import CombinedEmbedding
 from layers.Embed import CombinedEmbedding2
 import numpy as np
 from st_moe_pytorch.st_moe_pytorch import MoE
+from st_moe_pytorch import SparseMoEBlock
 
 
 class Model(nn.Module):
@@ -23,7 +24,7 @@ class Model(nn.Module):
         self.output_attention = configs.output_attention
         self.use_norm = configs.use_norm
         # Embedding
-        #self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout)
+        # self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout)
         self.enc_embedding = DataEmbeddingMamba_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq,configs.dropout)
         self.class_strategy = configs.class_strategy
         # Encoder-only architecture
@@ -41,17 +42,24 @@ class Model(nn.Module):
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
-        self.mole = MoE(
+        self.moe = MoE(
                   dim = configs.d_model,
                   num_experts = 16,               # increase the experts (# parameters) of your model without increasing computation
                   gating_top_n = 2,               # default to top 2 gating, but can also be more (3 was tested in the paper with a lower threshold)
                   threshold_train = 0.2,          # at what threshold to accept a token to be routed to second expert and beyond - 0.2 was optimal for 2 expert routing, and apparently should be lower for 3
                   threshold_eval = 0.2,
                   capacity_factor_train = 1.25,   # experts have fixed capacity per batch. we need some extra capacity in case gating is not perfectly balanced.
-                  capacity_factor_eval = 2.,      # capacity_factor_* should be set to a value >=1
+                  capacity_factor_eval = 2.,    # capacity_factor_* should be set to a value >=1
                   balance_loss_coef = 1e-2,       # multiplier on the auxiliary expert balancing auxiliary loss
                   router_z_loss_coef = 1e-3,      # loss weight for router z-loss
         ) 
+
+        self.moe_block = SparseMoEBlock(
+                  self.moe,
+                  add_ff_before = True,
+                  add_ff_after = True
+        )
+
         self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -75,7 +83,7 @@ class Model(nn.Module):
         # the dimensions of embedded time series has been inverted, and then processed by native attn, layernorm and ffn modules
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
 
-        enc_out = self.mole(enc_out)[0]
+        enc_out = self.moe_block(enc_out)[0]
 
         # B N E -> B N S -> B S N 
         dec_out = self.projector(enc_out).permute(0, 2, 1)[:, :, :N] # filter the covariates
